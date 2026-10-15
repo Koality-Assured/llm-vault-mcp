@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import {
+  type ApiEncryptedEnvelope,
   buildAgentKeyWrapAad,
   buildCanonicalAad,
   bytesToHex,
@@ -11,6 +12,9 @@ import {
   computeTagBlindIndex,
   decryptWithAad,
   encryptWithAad,
+  formatApiEnvelope,
+  formatCanonicalAadString,
+  parseApiEnvelope,
   unwrapVaultKeyForAgent,
   wrapVaultKeyForAgent,
   zeroizeBuffer,
@@ -134,19 +138,21 @@ export type OobSecretPromptHandler = (prompt: {
 }) => Promise<Uint8Array>;
 
 export interface VaultRuntimeOptions {
-  tenantId?: string;
-  agentId?: PrefixedId<"agt">;
-  deploymentMode?: DeploymentMode;
-  keychainUnlocked?: boolean;
-  allowRawContextReveal?: boolean;
-  scopes?: ReadonlyArray<PermissionScope>;
-  agentDecryptionKey?: Uint8Array;
-  auditLogKey?: Uint8Array;
-  leaseManager?: LeaseManager;
-  commandRunner?: CommandRunner;
-  httpFetcher?: HttpFetcher;
-  oobConfirmHandler?: OobConfirmationHandler;
-  oobSecretPromptHandler?: OobSecretPromptHandler;
+  tenantId?: string | undefined;
+  agentId?: PrefixedId<"agt"> | undefined;
+  deploymentMode?: DeploymentMode | undefined;
+  keychainUnlocked?: boolean | undefined;
+  allowRawContextReveal?: boolean | undefined;
+  scopes?: ReadonlyArray<PermissionScope> | undefined;
+  agentDecryptionKey?: Uint8Array | undefined;
+  auditLogKey?: Uint8Array | undefined;
+  leaseManager?: LeaseManager | undefined;
+  commandRunner?: CommandRunner | undefined;
+  httpFetcher?: HttpFetcher | undefined;
+  oobConfirmHandler?: OobConfirmationHandler | undefined;
+  oobSecretPromptHandler?: OobSecretPromptHandler | undefined;
+  remoteApiUrl?: string | undefined;
+  agentToken?: string | undefined;
 }
 
 const GENESIS_PREV_HASH = "0".repeat(64);
@@ -241,7 +247,9 @@ export class VaultRuntime {
   public readonly allowRawContextReveal: boolean;
   public readonly scopes: Set<PermissionScope>;
   public readonly leaseManager: LeaseManager;
+  public readonly remoteApiUrl?: string | undefined;
 
+  private readonly agentToken?: string | undefined;
   private readonly agentDecryptionKey: Uint8Array;
   private readonly auditLogKey: Uint8Array;
   private readonly vaults = new Map<PrefixedId<"vlt">, StoredVaultEnvelope>();
@@ -260,6 +268,8 @@ export class VaultRuntime {
     this.allowRawContextReveal = options.allowRawContextReveal ?? false;
     this.scopes = new Set(options.scopes ?? DEFAULT_SCOPES);
     this.leaseManager = options.leaseManager ?? new LeaseManager();
+    this.remoteApiUrl = options.remoteApiUrl ?? process.env.LLM_VAULT_URL;
+    this.agentToken = options.agentToken ?? process.env.LLM_VAULT_AGENT_TOKEN;
     this.agentDecryptionKey =
       options.agentDecryptionKey ?? globalThis.crypto.getRandomValues(new Uint8Array(32));
     this.auditLogKey = options.auditLogKey ?? globalThis.crypto.getRandomValues(new Uint8Array(32));
@@ -273,6 +283,14 @@ export class VaultRuntime {
           "No interactive OOB TTY/OS prompt handler configured for this headless MCP session",
         );
       });
+  }
+
+  public getAuthHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {};
+    if (this.agentToken) {
+      headers["authorization"] = `Bearer ${this.agentToken}`;
+    }
+    return headers;
   }
 
   public assertScope(required: PermissionScope): void {
@@ -329,6 +347,40 @@ export class VaultRuntime {
     if (!first.done) {
       return first.value;
     }
+    if (this.remoteApiUrl) {
+      try {
+        const res = await this.httpFetcher(`${this.remoteApiUrl}/api/v1/vaults`, {
+          method: "GET",
+          headers: this.getAuthHeaders(),
+        });
+        if (res.status === 200) {
+          const bodyObj = JSON.parse(res.body) as {
+            vaults?: Array<{ id: string; keyVersion?: number }>;
+          };
+          if (Array.isArray(bodyObj.vaults) && bodyObj.vaults.length > 0) {
+            const remoteVault = bodyObj.vaults[0]!;
+            if (isValidId(remoteVault.id, "vlt")) {
+              const remoteVaultId = remoteVault.id as PrefixedId<"vlt">;
+              if (!this.vaults.has(remoteVaultId)) {
+                this.vaults.set(remoteVaultId, {
+                  vaultId: remoteVaultId,
+                  tenantId: this.tenantId,
+                  keyVersion: remoteVault.keyVersion ?? 1,
+                  agentEncryptedVaultKey: new Uint8Array(),
+                  agentWrapIv: new Uint8Array(),
+                  vaultSearchKey: globalThis.crypto.getRandomValues(new Uint8Array(32)),
+                });
+              }
+              return remoteVaultId;
+            }
+          }
+        }
+      } catch (err: unknown) {
+        process.stderr.write(
+          `Notice: failed to query remote vaults from ${this.remoteApiUrl}: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
+    }
     return this.provisionVault();
   }
 
@@ -336,8 +388,38 @@ export class VaultRuntime {
     vaultKey: CryptoKey;
     envelope: StoredVaultEnvelope;
   }> {
-    const envelope = this.vaults.get(vaultId);
-    if (!envelope) {
+    let envelope = this.vaults.get(vaultId);
+    if ((!envelope || envelope.agentEncryptedVaultKey.byteLength === 0) && this.remoteApiUrl) {
+      try {
+        const res = await this.httpFetcher(
+          `${this.remoteApiUrl}/api/v1/agents/${this.agentId}/vault-key`,
+          {
+            method: "GET",
+            headers: this.getAuthHeaders(),
+          },
+        );
+        if (res.status === 200) {
+          const keyData = JSON.parse(res.body) as {
+            vaultId: string;
+            keyVersion: number;
+            agentEncryptedVaultKey: ApiEncryptedEnvelope;
+          };
+          const parsed = parseApiEnvelope(keyData.agentEncryptedVaultKey);
+          envelope = {
+            vaultId,
+            tenantId: this.tenantId,
+            keyVersion: keyData.keyVersion ?? 1,
+            agentEncryptedVaultKey: parsed.ciphertext,
+            agentWrapIv: parsed.iv,
+            vaultSearchKey: globalThis.crypto.getRandomValues(new Uint8Array(32)),
+          };
+          this.vaults.set(vaultId, envelope);
+        }
+      } catch {
+        // Fall through to error check below
+      }
+    }
+    if (!envelope || envelope.agentEncryptedVaultKey.byteLength === 0) {
       throw new Error(
         `Vault "${vaultId}" is not registered or accessible to agent "${this.agentId}"`,
       );
@@ -427,6 +509,41 @@ export class VaultRuntime {
     };
 
     this.secrets.set(secretId, record);
+    if (this.remoteApiUrl) {
+      const aadString = formatCanonicalAadString({
+        tenantId: envelope.tenantId,
+        vaultId: envelope.vaultId,
+        secretId,
+        version,
+        keyVersion: envelope.keyVersion,
+      });
+      const metaEnvelope = formatApiEnvelope(encryptedMeta, aadString, envelope.keyVersion);
+      const payloadEnvelope = formatApiEnvelope(encryptedPayload, aadString, envelope.keyVersion);
+
+      const res = await this.httpFetcher(
+        `${this.remoteApiUrl}/api/v1/vaults/${envelope.vaultId}/secrets`,
+        {
+          method: "POST",
+          headers: {
+            ...this.getAuthHeaders(),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            id: secretId,
+            vaultId: envelope.vaultId,
+            folderId: params.folderId,
+            version,
+            keyVersion: envelope.keyVersion,
+            encryptedMetadata: metaEnvelope,
+            encryptedPayload: payloadEnvelope,
+            tagBlindIndexes,
+          }),
+        },
+      );
+      if (res.status >= 400) {
+        throw new Error(`Remote API error storing secret: ${res.status} ${res.body}`);
+      }
+    }
     await this.appendAuditEvent(existing ? "secrets:update" : "secrets:create", secretId);
 
     return {
@@ -490,6 +607,71 @@ export class VaultRuntime {
     plaintextBytes: Uint8Array;
   }> {
     this.assertScope("secrets:reveal");
+
+    if (this.remoteApiUrl) {
+      const res = await this.httpFetcher(`${this.remoteApiUrl}/api/v1/secrets/${secretId}/reveal`, {
+        method: "POST",
+        headers: this.getAuthHeaders(),
+      });
+      if (res.status !== 200) {
+        throw new Error(`Remote API error revealing secret: ${res.status} ${res.body}`);
+      }
+      const json = JSON.parse(res.body) as {
+        id: string;
+        vaultId: string;
+        version: number;
+        keyVersion: number;
+        encryptedPayload: ApiEncryptedEnvelope;
+        encryptedVaultKey: ApiEncryptedEnvelope;
+        auditEventId: string;
+      };
+
+      const vaultId = json.vaultId as PrefixedId<"vlt">;
+      let envelope = this.vaults.get(vaultId);
+      if (!envelope || envelope.agentEncryptedVaultKey.byteLength === 0) {
+        const wrappedKeyEnv = parseApiEnvelope(json.encryptedVaultKey);
+        envelope = {
+          vaultId,
+          tenantId: this.tenantId,
+          keyVersion: json.keyVersion,
+          agentEncryptedVaultKey: wrappedKeyEnv.ciphertext,
+          agentWrapIv: wrappedKeyEnv.iv,
+          vaultSearchKey: globalThis.crypto.getRandomValues(new Uint8Array(32)),
+        };
+        this.vaults.set(vaultId, envelope);
+      }
+
+      const { vaultKey } = await this.unwrapVaultKey(vaultId);
+      const payloadEnv = parseApiEnvelope(json.encryptedPayload);
+      const aadBytes = textEncoder.encode(json.encryptedPayload.aad);
+      const plaintextBytes = await decryptWithAad(
+        vaultKey,
+        payloadEnv.ciphertext,
+        payloadEnv.iv,
+        aadBytes,
+      );
+
+      let record = this.secrets.get(secretId);
+      if (!record) {
+        record = {
+          id: secretId,
+          tenantId: this.tenantId,
+          vaultId,
+          version: json.version,
+          keyVersion: json.keyVersion,
+          tagBlindIndexes: [],
+          encryptedMetadata: new Uint8Array(),
+          metadataIv: new Uint8Array(),
+          encryptedPayload: payloadEnv.ciphertext,
+          payloadIv: payloadEnv.iv,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        this.secrets.set(secretId, record);
+      }
+      return { record, plaintextBytes };
+    }
+
     const record = this.secrets.get(secretId);
     if (!record) {
       throw new Error(`Secret "${secretId}" not found`);
@@ -535,6 +717,69 @@ export class VaultRuntime {
     this.assertScope("secrets:read");
     const normalizedQuery = filter.query?.trim().toLowerCase();
     const normalizedTag = filter.tag?.trim().toLowerCase();
+
+    if (this.remoteApiUrl) {
+      const targetVaultId = filter.vaultId ?? (await this.ensureDefaultVault());
+      let url = `${this.remoteApiUrl}/api/v1/vaults/${targetVaultId}/secrets`;
+      if (normalizedTag) {
+        const envelope = this.vaults.get(targetVaultId);
+        if (envelope && envelope.vaultSearchKey.byteLength === 32) {
+          const blindIndex = await computeTagBlindIndex(envelope.vaultSearchKey, normalizedTag);
+          url += `?tagBlindIndex=${encodeURIComponent(blindIndex)}`;
+        }
+      }
+      try {
+        const res = await this.httpFetcher(url, {
+          method: "GET",
+          headers: this.getAuthHeaders(),
+        });
+        if (res.status === 200) {
+          const data = JSON.parse(res.body) as {
+            secrets: Array<{
+              id: string;
+              vaultId: string;
+              folderId?: string;
+              version: number;
+              keyVersion: number;
+              encryptedMetadata: ApiEncryptedEnvelope;
+              tagBlindIndexes?: string[];
+              createdAt: string;
+              updatedAt: string;
+            }>;
+          };
+          for (const s of data.secrets) {
+            const resolvedVaultId =
+              s.vaultId && isValidId(s.vaultId, "vlt") ? s.vaultId : targetVaultId;
+            if (isValidId(s.id, "sec") && isValidId(resolvedVaultId, "vlt")) {
+              const parsedMeta = parseApiEnvelope(s.encryptedMetadata);
+              const secRecord: StoredCiphertextSecretRecord = {
+                id: s.id as PrefixedId<"sec">,
+                tenantId: this.tenantId,
+                vaultId: resolvedVaultId as PrefixedId<"vlt">,
+                folderId:
+                  s.folderId && isValidId(s.folderId, "fld")
+                    ? (s.folderId as PrefixedId<"fld">)
+                    : undefined,
+                version: s.version,
+                keyVersion: s.keyVersion,
+                tagBlindIndexes: s.tagBlindIndexes ?? [],
+                encryptedMetadata: parsedMeta.ciphertext,
+                metadataIv: parsedMeta.iv,
+                encryptedPayload: new Uint8Array(),
+                payloadIv: new Uint8Array(),
+                createdAt: s.createdAt,
+                updatedAt: s.updatedAt,
+              };
+              this.secrets.set(secRecord.id, secRecord);
+            }
+          }
+        }
+      } catch (err: unknown) {
+        process.stderr.write(
+          `Notice: failed to search secrets from ${this.remoteApiUrl}: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
+    }
 
     const results: Array<{
       id: PrefixedId<"sec">;
@@ -616,7 +861,53 @@ export class VaultRuntime {
     plaintextValue?: string;
   }> {
     this.assertScope("secrets:read");
-    const record = this.secrets.get(params.secretId);
+    let record = this.secrets.get(params.secretId);
+    if (!record && this.remoteApiUrl) {
+      try {
+        const res = await this.httpFetcher(
+          `${this.remoteApiUrl}/api/v1/secrets/${params.secretId}`,
+          {
+            method: "GET",
+            headers: this.getAuthHeaders(),
+          },
+        );
+        if (res.status === 200) {
+          const s = JSON.parse(res.body) as {
+            id: string;
+            vaultId: string;
+            folderId?: string;
+            version: number;
+            keyVersion: number;
+            encryptedMetadata: ApiEncryptedEnvelope;
+            tagBlindIndexes?: string[];
+            createdAt: string;
+            updatedAt: string;
+          };
+          const parsedMeta = parseApiEnvelope(s.encryptedMetadata);
+          record = {
+            id: s.id as PrefixedId<"sec">,
+            tenantId: this.tenantId,
+            vaultId: s.vaultId as PrefixedId<"vlt">,
+            folderId:
+              s.folderId && isValidId(s.folderId, "fld")
+                ? (s.folderId as PrefixedId<"fld">)
+                : undefined,
+            version: s.version,
+            keyVersion: s.keyVersion,
+            tagBlindIndexes: s.tagBlindIndexes ?? [],
+            encryptedMetadata: parsedMeta.ciphertext,
+            metadataIv: parsedMeta.iv,
+            encryptedPayload: new Uint8Array(),
+            payloadIv: new Uint8Array(),
+            createdAt: s.createdAt,
+            updatedAt: s.updatedAt,
+          };
+          this.secrets.set(record.id, record);
+        }
+      } catch {
+        // Fall through
+      }
+    }
     if (!record) {
       throw new Error(`Secret "${params.secretId}" not found`);
     }
@@ -981,6 +1272,51 @@ export class VaultRuntime {
     events: AuditLogEvent[];
   }> {
     this.assertScope("admin:audit:read");
+
+    if (this.remoteApiUrl) {
+      try {
+        const res = await this.httpFetcher(`${this.remoteApiUrl}/api/v1/audit/logs`, {
+          method: "GET",
+          headers: this.getAuthHeaders(),
+        });
+        if (res.status === 200) {
+          const data = JSON.parse(res.body) as {
+            logs: Array<{
+              id: string;
+              timestamp: string;
+              actorId: string;
+              action: string;
+              targetId: string;
+              prevEventHash: string;
+              eventHash: string;
+            }>;
+          };
+          const mappedLogs: AuditLogEvent[] = data.logs.map((l) => ({
+            id: l.id as PrefixedId<"aud">,
+            timestamp: l.timestamp,
+            actorId: l.actorId as PrefixedId<"agt"> | PrefixedId<"usr">,
+            action: l.action,
+            targetId: l.targetId,
+            prevEventHash: l.prevEventHash,
+            eventHash: l.eventHash,
+          }));
+
+          const filtered = params.actionFilter
+            ? mappedLogs.filter((e) => e.action === params.actionFilter)
+            : mappedLogs;
+          const limit = params.limit ?? 50;
+          return {
+            chainValid: true,
+            totalEvents: mappedLogs.length,
+            events: filtered.slice(0, limit),
+          };
+        }
+      } catch (err: unknown) {
+        process.stderr.write(
+          `Notice: failed to fetch remote audit logs: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
+    }
 
     let expectedPrev = GENESIS_PREV_HASH;
     let chainValid = true;

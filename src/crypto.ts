@@ -297,3 +297,68 @@ export function bytesToBase64(bytes: Uint8Array): string {
 export function base64ToBytes(b64: string): Uint8Array {
   return new Uint8Array(Buffer.from(b64, "base64"));
 }
+
+export interface ApiEncryptedEnvelope {
+  algorithm: "AES-256-GCM";
+  ciphertext: string;
+  iv: string;
+  authTag: string;
+  aad: string;
+  keyVersion: number;
+}
+
+export function splitCiphertextAndTag(combinedBytes: Uint8Array): {
+  ciphertext: Uint8Array;
+  authTag: Uint8Array;
+} {
+  const AES_GCM_TAG_BYTES = AES_GCM_TAG_BITS / 8;
+  if (combinedBytes.byteLength < AES_GCM_TAG_BYTES) {
+    throw new Error(
+      `Ciphertext must be at least ${AES_GCM_TAG_BYTES} bytes to contain authentication tag`,
+    );
+  }
+  const splitPoint = combinedBytes.byteLength - AES_GCM_TAG_BYTES;
+  return {
+    ciphertext: combinedBytes.subarray(0, splitPoint),
+    authTag: combinedBytes.subarray(splitPoint),
+  };
+}
+
+export function joinCiphertextAndTag(
+  ciphertextBytes: Uint8Array,
+  authTagBytes: Uint8Array,
+): Uint8Array {
+  const combined = new Uint8Array(ciphertextBytes.byteLength + authTagBytes.byteLength);
+  combined.set(ciphertextBytes, 0);
+  combined.set(authTagBytes, ciphertextBytes.byteLength);
+  return combined;
+}
+
+export function formatApiEnvelope(
+  envelope: EncryptedEnvelope,
+  aadString: string,
+  keyVersion = 1,
+): ApiEncryptedEnvelope {
+  const { ciphertext, authTag } = splitCiphertextAndTag(envelope.ciphertext);
+  return {
+    algorithm: "AES-256-GCM",
+    ciphertext: bytesToBase64(ciphertext),
+    iv: bytesToBase64(envelope.iv),
+    authTag: bytesToBase64(authTag),
+    aad: aadString,
+    keyVersion,
+  };
+}
+
+export function parseApiEnvelope(apiEnvelope: {
+  ciphertext: string;
+  iv: string;
+  authTag: string;
+}): EncryptedEnvelope {
+  const ct = base64ToBytes(apiEnvelope.ciphertext);
+  const tag = base64ToBytes(apiEnvelope.authTag);
+  return {
+    ciphertext: joinCiphertextAndTag(ct, tag),
+    iv: base64ToBytes(apiEnvelope.iv),
+  };
+}

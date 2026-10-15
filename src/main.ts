@@ -1,10 +1,18 @@
+import fs from "node:fs";
 import { createServer } from "node:http";
+import net from "node:net";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
+import { hexToBytes } from "./crypto.js";
 import { createVaultMcpServer, VaultRuntime } from "./tools.js";
-import { assertSupportedTransport } from "./transports.js";
+import {
+  assertSupportedTransport,
+  prepareSocketPath,
+  resolveSocketPath,
+  secureSocketPermissions,
+} from "./transports.js";
 
 export * from "./crypto.js";
 export * from "./ids.js";
@@ -13,16 +21,64 @@ export * from "./scrubber.js";
 export * from "./tools.js";
 export * from "./transports.js";
 
-async function runCli(): Promise<void> {
+export async function runCli(): Promise<void> {
   const transportName = assertSupportedTransport(process.argv[2] ?? "stdio");
+  const agentKeyHex = process.env.LLM_VAULT_AGENT_KEY?.trim();
   const runtime = new VaultRuntime({
     deploymentMode: process.env.DEPLOYMENT_MODE === "enterprise" ? "enterprise" : "standalone",
+    remoteApiUrl: process.env.LLM_VAULT_URL,
+    agentToken: process.env.LLM_VAULT_AGENT_TOKEN,
+    agentDecryptionKey: agentKeyHex ? hexToBytes(agentKeyHex) : undefined,
   });
   await runtime.ensureDefaultVault();
   const server = createVaultMcpServer(runtime);
 
   if (transportName === "stdio") {
     await server.connect(new StdioServerTransport());
+    return;
+  }
+
+  if (transportName === "socket") {
+    const socketPath = resolveSocketPath(process.argv[3]);
+    prepareSocketPath(socketPath);
+
+    const socketServer = net.createServer(async (socket) => {
+      const clientTransport = new StdioServerTransport(socket, socket);
+      const clientServer = createVaultMcpServer(runtime);
+      try {
+        await clientServer.connect(clientTransport);
+      } catch (err: unknown) {
+        process.stderr.write(
+          `Error connecting MCP server over socket: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+        socket.destroy();
+      }
+      socket.on("close", () => {
+        void clientServer.close();
+      });
+    });
+
+    socketServer.listen(socketPath, () => {
+      secureSocketPermissions(socketPath);
+      process.stderr.write(`llm-vault-mcp listening on socket ${socketPath}\n`);
+    });
+
+    const shutdown = () => {
+      runtime.leaseManager.disposeAll();
+      socketServer.close(() => {
+        if (process.platform !== "win32") {
+          try {
+            fs.rmSync(socketPath, { force: true });
+          } catch {
+            // Ignore if file doesn't exist
+          }
+        }
+        process.exit(0);
+      });
+    };
+
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
     return;
   }
 

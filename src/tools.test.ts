@@ -2,15 +2,19 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { describe, expect, it } from "vitest";
 
+import { buildAgentKeyWrapAad, formatApiEnvelope, wrapVaultKeyForAgent } from "./crypto.js";
+import { generateId } from "./ids.js";
 import {
   createVaultMcpServer,
   REGISTERED_TOOL_NAMES,
   VaultRuntime,
+  type HttpFetcher,
   type VaultRuntimeOptions,
 } from "./tools.js";
 import { assertSupportedTransport } from "./transports.js";
 
 const encoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 async function createConnectedTestPair(options: VaultRuntimeOptions = {}) {
   const runtime = new VaultRuntime(options);
@@ -295,6 +299,180 @@ describe("llm-vault-mcp zero-context tool contracts", () => {
     expect(auditData.totalEvents).toBeGreaterThanOrEqual(2);
     expect(auditData.events[0]?.prevEventHash).toBe("0".repeat(64));
     expect(auditData.events[1]?.prevEventHash).toBe(auditData.events[0]?.eventHash);
+  });
+
+  it("operates in Remote API Client Mode: delegates encrypted storage and reveal while keeping decryption local", async () => {
+    const agentId = generateId("agt");
+    const vaultId = generateId("vlt");
+    const agentDecryptionKey = globalThis.crypto.getRandomValues(new Uint8Array(32));
+    const rawVaultKey = globalThis.crypto.getRandomValues(new Uint8Array(32));
+
+    // Pre-wrap VaultKey for this agent identity
+    const wrapAad = buildAgentKeyWrapAad({
+      tenantId: "tnt_default",
+      vaultId,
+      agentId,
+      keyVersion: 1,
+    });
+    const wrappedKeyEnv = await wrapVaultKeyForAgent(agentDecryptionKey, rawVaultKey, wrapAad);
+    const apiWrappedKey = formatApiEnvelope(wrappedKeyEnv, textDecoder.decode(wrapAad), 1);
+
+    // Mock remote server state
+    const remoteSecrets = new Map<string, Record<string, unknown>>();
+    const postedBodies: string[] = [];
+
+    const mockFetcher: HttpFetcher = async (url, init) => {
+      expect(init.headers["authorization"]).toBe("Bearer agt_secret_token_123");
+
+      if (url.endsWith("/api/v1/vaults") && init.method === "GET") {
+        return {
+          status: 200,
+          statusText: "OK",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ vaults: [{ id: vaultId, keyVersion: 1 }] }),
+        };
+      }
+
+      if (url.includes(`/api/v1/agents/${agentId}/vault-key`) && init.method === "GET") {
+        return {
+          status: 200,
+          statusText: "OK",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            vaultId,
+            keyVersion: 1,
+            agentEncryptedVaultKey: apiWrappedKey,
+          }),
+        };
+      }
+
+      if (url.includes(`/api/v1/vaults/${vaultId}/secrets`) && init.method === "POST") {
+        postedBodies.push(init.body!);
+        const parsed = JSON.parse(init.body!);
+        parsed.vaultId = vaultId;
+        remoteSecrets.set(parsed.id, parsed);
+        return {
+          status: 201,
+          statusText: "Created",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: parsed.id, vaultId, version: 1 }),
+        };
+      }
+
+      if (url.includes(`/api/v1/vaults/${vaultId}/secrets`) && init.method === "GET") {
+        return {
+          status: 200,
+          statusText: "OK",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ secrets: Array.from(remoteSecrets.values()) }),
+        };
+      }
+
+      const revealMatch = url.match(/\/api\/v1\/secrets\/(sec_[^/]+)\/reveal$/);
+      if (revealMatch && init.method === "POST") {
+        const secId = revealMatch[1]!;
+        const sec = remoteSecrets.get(secId);
+        if (!sec) {
+          return { status: 404, statusText: "Not Found", headers: {}, body: "{}" };
+        }
+        return {
+          status: 200,
+          statusText: "OK",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            id: secId,
+            vaultId,
+            version: 1,
+            keyVersion: 1,
+            encryptedPayload: sec.encryptedPayload,
+            encryptedVaultKey: apiWrappedKey,
+            auditEventId: generateId("aud"),
+          }),
+        };
+      }
+
+      return { status: 404, statusText: "Not Found", headers: {}, body: "{}" };
+    };
+
+    const { client } = await createConnectedTestPair({
+      agentId,
+      remoteApiUrl: "https://vault.internal.corp",
+      agentToken: "agt_secret_token_123",
+      agentDecryptionKey,
+      httpFetcher: mockFetcher,
+    });
+
+    // 1. Generate & store secret via MCP
+    const genRes = await client.callTool({
+      name: "vault_generate_and_store_secret",
+      arguments: {
+        vaultId,
+        name: "Remote Stored Database Password",
+        description: "Postgres connection credential",
+        tags: ["database", "postgres"],
+        byteLength: 32,
+      },
+    });
+    const created = parseToolJson<{ id: string; handle: string }>(genRes);
+    expect(created.id).toMatch(/^sec_/);
+
+    // 2. Verify that what was sent over the wire to the API server is strictly ciphertext
+    expect(postedBodies).toHaveLength(1);
+    const wireBody = postedBodies[0]!;
+    expect(wireBody).toContain("AES-256-GCM");
+    expect(wireBody).not.toContain("Remote Stored Database Password");
+    expect(wireBody).not.toContain("postgres");
+
+    // 3. Search secrets via remote API
+    const searchRes = await client.callTool({
+      name: "vault_search",
+      arguments: { query: "postgres" },
+    });
+    const searchMatches = parseToolJson<Array<{ id: string; name: string }>>(searchRes);
+    expect(searchMatches).toHaveLength(1);
+    expect(searchMatches[0]?.id).toBe(created.id);
+    expect(searchMatches[0]?.name).toBe("Remote Stored Database Password");
+
+    // 4. Execute command injecting secret handle — resolves via remote /reveal endpoint and scrubs output
+    let executedEnv: Record<string, string> = {};
+    const cmdRuntime = new VaultRuntime({
+      agentId,
+      remoteApiUrl: "https://vault.internal.corp",
+      agentToken: "agt_secret_token_123",
+      agentDecryptionKey,
+      httpFetcher: mockFetcher,
+      commandRunner: async (_cmd, _args, env) => {
+        executedEnv = env;
+        return {
+          exitCode: 0,
+          stdout: `Exported DB_PASS=${env.DB_PASS}`,
+          stderr: "",
+        };
+      },
+    });
+    const cmdServer = createVaultMcpServer(cmdRuntime);
+    const cmdClient = new Client({ name: "cmd-client", version: "0.1.0" });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await Promise.all([cmdServer.connect(sTrans), cmdClient.connect(cTrans)]);
+
+    const runRes = await cmdClient.callTool({
+      name: "vault_run_command",
+      arguments: {
+        command: "node",
+        args: ["-e", "console.log(process.env.DB_PASS)"],
+        env: {
+          DB_PASS: created.handle,
+        },
+      },
+    });
+
+    const runOut = parseToolJson<{ exitCode: number; stdout: string }>(runRes);
+    expect(runOut.exitCode).toBe(0);
+    // Secret was decrypted locally and passed to child process environment
+    expect(executedEnv.DB_PASS).toBeDefined();
+    expect(executedEnv.DB_PASS).not.toBe(created.handle);
+    // Output was scrubbed so raw secret does not leak into tool response or LLM context
+    expect(runOut.stdout).toContain(`DB_PASS=[REDACTED:${created.id}]`);
   });
 
   it("validates supported MCP transports and rejects deprecated SSE", () => {

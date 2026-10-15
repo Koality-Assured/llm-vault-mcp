@@ -80,9 +80,12 @@ export function generateId<P extends IdPrefix>(
  * Optionally enforces a specific prefix.
  */
 export function isValidId<P extends IdPrefix = IdPrefix>(
-  value: string,
+  value: unknown,
   expectedPrefix?: P,
 ): value is PrefixedId<P> {
+  if (typeof value !== "string") {
+    return false;
+  }
   const separatorIdx = value.indexOf("_");
   if (separatorIdx <= 0) {
     return false;
