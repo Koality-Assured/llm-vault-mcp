@@ -1,4 +1,26 @@
-# llm-vault-mcp
+<div align="center">
+
+![LLM Vault MCP Banner](assets/llm-vault-mcp-banner.svg)
+
+# LLM Vault MCP
+
+<p align="center">
+  <img src="assets/llm-vault-mcp-logo.svg" alt="LLM Vault MCP Logo" width="128" height="128" />
+</p>
+
+**Model Context Protocol Server for Zero-Context Secret Injection & Local Envelope Decryption**
+
+[![CI](https://github.com/Koality-Assured/llm-vault-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Koality-Assured/llm-vault-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Protocol: MCP](https://img.shields.io/badge/protocol-MCP-orange.svg)](https://modelcontextprotocol.io/)
+[![Node.js 22+](https://img.shields.io/badge/node-22+-green.svg)](https://nodejs.org/)
+[![TypeScript 5.x](https://img.shields.io/badge/typescript-5.x-blue.svg)](https://www.typescriptlang.org/)
+[![Domain: Llm-Vault-Mcp](https://img.shields.io/badge/domain-llm-vault-mcp-blueviolet.svg)](<>)
+[![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-yellow.svg)](https://conventionalcommits.org)
+
+</div>
+
+---
 
 Model Context Protocol (MCP) server for [`llm-vault`](https://github.com/Koality-Assured/llm-vault). It decrypts secret envelopes locally via the W3C Web Cryptography API (`crypto.subtle`) and injects credentials into child processes or outbound HTTP requests without exposing plaintext secret values to LLM context windows, chat transcripts, or model telemetry.
 
