@@ -1,7 +1,18 @@
 import { execFile } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { promisify } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import {
+  scanContent,
+  scanWorkspace,
+  installPreCommitHook,
+  removePreCommitHook,
+  getPreCommitHookStatus,
+  type SecretScanResult,
+  type PreCommitHookStatus,
+} from "./scanner.js";
 
 import {
   type ApiEncryptedEnvelope,
@@ -1533,6 +1544,217 @@ export class VaultRuntime {
       events,
     };
   }
+
+  /**
+   * Scans workspace files or arbitrary text content for unencrypted credentials (`Slice 9`).
+   */
+  public async scanWorkspace(params: {
+    path?: string | undefined;
+    content?: string | undefined;
+    stagedOnly?: boolean | undefined;
+    minEntropy?: number | undefined;
+  }): Promise<SecretScanResult> {
+    if (params.content !== undefined) {
+      const startTime = Date.now();
+      const findings = scanContent(params.content, params.path ?? "inline", {
+        minEntropy: params.minEntropy,
+      });
+      return {
+        scannedFiles: 1,
+        findingsCount: findings.length,
+        findings,
+        clean: findings.length === 0,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    if (params.path && fs.existsSync(params.path) && fs.statSync(params.path).isFile()) {
+      const startTime = Date.now();
+      const content = fs.readFileSync(params.path, "utf8");
+      const findings = scanContent(content, params.path, {
+        minEntropy: params.minEntropy,
+      });
+      return {
+        scannedFiles: 1,
+        findingsCount: findings.length,
+        findings,
+        clean: findings.length === 0,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    return await scanWorkspace({
+      directory: params.path,
+      stagedOnly: params.stagedOnly,
+      minEntropy: params.minEntropy,
+    });
+  }
+
+  /**
+   * Discovers plaintext credentials in a configuration file, encrypts them locally into `VaultKey` + AAD records,
+   * rewrites the file or creates a `.tpl` template containing `{{vault:sec_<ulid>}}` handles, and adds `.env` to `.gitignore`.
+   */
+  public async absorbCredentials(params: {
+    filePath: string;
+    dryRun?: boolean | undefined;
+    inPlace?: boolean | undefined;
+    generateTemplate?: boolean | undefined;
+    vaultId?: PrefixedId<"vlt"> | undefined;
+  }): Promise<{
+    success: boolean;
+    dryRun: boolean;
+    vaultId?: string | undefined;
+    absorbedCount: number;
+    actions: Array<{
+      filePath: string;
+      line: number;
+      secretName: string;
+      secretId: string;
+      handle: string;
+      templatePath?: string | undefined;
+      replaced: boolean;
+    }>;
+  }> {
+    this.assertScope("secrets:create");
+    const targetVaultId = params.vaultId ?? (await this.ensureDefaultVault());
+    const resolvedPath = path.resolve(process.cwd(), params.filePath);
+
+    if (!fs.existsSync(resolvedPath)) {
+      throw new Error(`Target file does not exist: "${resolvedPath}"`);
+    }
+
+    const content = fs.readFileSync(resolvedPath, "utf8");
+    const findings = scanContent(content, params.filePath);
+
+    if (findings.length === 0) {
+      return {
+        success: true,
+        dryRun: Boolean(params.dryRun),
+        vaultId: targetVaultId,
+        absorbedCount: 0,
+        actions: [],
+      };
+    }
+
+    const actions: Array<{
+      filePath: string;
+      line: number;
+      secretName: string;
+      secretId: string;
+      handle: string;
+      templatePath?: string | undefined;
+      replaced: boolean;
+    }> = [];
+
+    let updatedContent = content;
+    const isEnv = path.basename(resolvedPath).startsWith(".env");
+    const templatePath = isEnv ? `${resolvedPath}.tpl` : undefined;
+    const processed = new Set<string>();
+
+    for (const finding of findings) {
+      if (processed.has(finding.rawValue)) continue;
+      processed.add(finding.rawValue);
+
+      const lines = content.split(/\r?\n/);
+      const lineStr = lines[finding.line - 1] ?? "";
+      const keyMatch = /^([A-Za-z0-9_-]+)\s*[:=]/.exec(lineStr.trim());
+      const secretName = keyMatch
+        ? keyMatch[1]!
+        : `${finding.ruleId}_${path.basename(resolvedPath)}`;
+
+      let secId: string;
+      let handle: string;
+
+      if (!params.dryRun) {
+        const secretBytes = textEncoder.encode(finding.rawValue);
+        try {
+          const stored = await this.storeEncryptedSecret({
+            vaultId: targetVaultId,
+            name: secretName,
+            description: `Absorbed from ${params.filePath}:${finding.line}`,
+            tags: ["absorbed", finding.ruleId],
+            plaintextBytes: secretBytes,
+          });
+          secId = stored.id;
+          handle = stored.handle;
+        } finally {
+          zeroizeBuffer(secretBytes);
+        }
+      } else {
+        secId = generateId("sec");
+        handle = `{{vault:${secId}}}`;
+      }
+
+      actions.push({
+        filePath: params.filePath,
+        line: finding.line,
+        secretName,
+        secretId: secId,
+        handle,
+        templatePath: templatePath
+          ? path.relative(process.cwd(), templatePath).replace(/\\/g, "/")
+          : undefined,
+        replaced: !params.dryRun,
+      });
+
+      updatedContent = updatedContent.split(finding.rawValue).join(handle);
+    }
+
+    if (!params.dryRun) {
+      if (isEnv && params.generateTemplate !== false) {
+        const tplFile = templatePath ?? `${resolvedPath}.tpl`;
+        fs.writeFileSync(tplFile, updatedContent, "utf8");
+
+        const gitignorePath = path.resolve(process.cwd(), ".gitignore");
+        const filename = path.basename(resolvedPath);
+        try {
+          if (fs.existsSync(gitignorePath)) {
+            const gi = fs.readFileSync(gitignorePath, "utf8");
+            if (!gi.includes(filename)) {
+              fs.appendFileSync(gitignorePath, `\n# llm-vault absorbed secrets\n${filename}\n`);
+            }
+          }
+        } catch {
+          // ignore
+        }
+
+        if (params.inPlace) {
+          fs.writeFileSync(resolvedPath, updatedContent, "utf8");
+        }
+      } else {
+        fs.writeFileSync(resolvedPath, updatedContent, "utf8");
+      }
+    }
+
+    return {
+      success: true,
+      dryRun: Boolean(params.dryRun),
+      vaultId: targetVaultId,
+      absorbedCount: actions.length,
+      actions,
+    };
+  }
+
+  /**
+   * Manages repository git pre-commit hook installation and status verification (`Slice 9`).
+   */
+  public async managePreCommitHook(params: {
+    action?: "install" | "remove" | "status" | undefined;
+    workspaceDir?: string | undefined;
+  }): Promise<PreCommitHookStatus> {
+    const dir = params.workspaceDir ?? process.cwd();
+    const action = params.action ?? "install";
+
+    switch (action) {
+      case "install":
+        return installPreCommitHook(dir);
+      case "remove":
+        return removePreCommitHook(dir);
+      case "status":
+      default:
+        return getPreCommitHookStatus(dir);
+    }
+  }
 }
 
 function jsonResult(value: unknown) {
@@ -1564,6 +1786,9 @@ export const REGISTERED_TOOL_NAMES = [
   "vault_delete_secret",
   "vault_confirm_action",
   "vault_admin_audit_logs",
+  "vault_scan_workspace",
+  "vault_absorb_credentials",
+  "vault_install_pre_commit_hook",
 ] as const;
 
 /**
@@ -1848,6 +2073,67 @@ export function createVaultMcpServer(runtime: VaultRuntime = new VaultRuntime())
     async (args) => {
       try {
         return jsonResult(await runtime.queryAuditLogs(args));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "vault_scan_workspace",
+    {
+      description:
+        "Scan workspace files, git staged diffs, or direct text content for unencrypted credentials, returning structured findings with line numbers, entropy, and suggested {{vault:sec_<ulid>}} handles.",
+      inputSchema: {
+        path: z.string().optional(),
+        content: z.string().optional(),
+        stagedOnly: z.boolean().optional(),
+        minEntropy: z.number().optional(),
+      },
+    },
+    async (args) => {
+      try {
+        return jsonResult(await runtime.scanWorkspace(args));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "vault_absorb_credentials",
+    {
+      description:
+        "Extract unencrypted secrets from a file (e.g. .env), encrypt them locally with VaultKey + AAD into sec_<ulid> records, and generate {{vault:sec_<ulid>}} template (.env.tpl).",
+      inputSchema: {
+        filePath: z.string().min(1),
+        dryRun: z.boolean().optional(),
+        inPlace: z.boolean().optional(),
+        vaultId: prefixedIdSchema("vlt").optional(),
+      },
+    },
+    async (args) => {
+      try {
+        return jsonResult(await runtime.absorbCredentials(args));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "vault_install_pre_commit_hook",
+    {
+      description:
+        "Install, check status of, or remove a zero-dependency git pre-commit hook that blocks unencrypted secrets from git staging.",
+      inputSchema: {
+        action: z.enum(["install", "remove", "status"]).optional(),
+        workspaceDir: z.string().optional(),
+      },
+    },
+    async (args) => {
+      try {
+        return jsonResult(await runtime.managePreCommitHook(args));
       } catch (err) {
         return errorResult(err);
       }

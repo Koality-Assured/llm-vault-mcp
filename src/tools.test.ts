@@ -1,5 +1,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { buildAgentKeyWrapAad, formatApiEnvelope, wrapVaultKeyForAgent } from "./crypto.js";
@@ -749,6 +752,172 @@ describe("llm-vault-mcp zero-context tool contracts", () => {
     // Verify redaction placeholder format
     expect(output.stdout).toContain(`[REDACTED:${created.id}]`);
     expect(output.stderr).toContain(`[REDACTED:${created.id}]`);
+  });
+
+  describe("Slice 9: Workspace Secret Scanner, Absorption & Git Hooks", () => {
+    it("scans content and workspace for unencrypted credentials via vault_scan_workspace", async () => {
+      const { client } = await createConnectedTestPair();
+
+      const mockOpenAi = ["sk", "proj", "TestingScannerOpenAiKey1234567890abcdef"].join("-");
+      const mockAnthropic = ["sk", "ant", "api03", "TestingScannerClaudeKey1234567890"].join("-");
+      const sampleCode = [
+        `const openAi = "${mockOpenAi}";`,
+        `const anthropic = "${mockAnthropic}";`,
+        'const aws = "AKIAIOSFODNN7EXAMPLE";',
+        'const safe = "{{vault:sec_01jk9876543210abcdefghij}}";',
+      ].join("\n");
+
+      const scanRes = await client.callTool({
+        name: "vault_scan_workspace",
+        arguments: {
+          content: sampleCode,
+          path: "src/test-config.ts",
+        },
+      });
+
+      expect(scanRes.isError).toBeFalsy();
+      const result = parseToolJson<{
+        scannedFiles: number;
+        findingsCount: number;
+        clean: boolean;
+        findings: Array<{
+          ruleId: string;
+          redactedValue: string;
+          suggestedHandle: string;
+        }>;
+      }>(scanRes);
+
+      expect(result.clean).toBe(false);
+      expect(result.findingsCount).toBe(3);
+      expect(result.findings.map((f) => f.ruleId)).toContain("openai-api-key");
+      expect(result.findings.map((f) => f.ruleId)).toContain("anthropic-api-key");
+      expect(result.findings.map((f) => f.ruleId)).toContain("aws-access-key-id");
+      for (const f of result.findings) {
+        expect(f.redactedValue).toContain("****");
+        expect(f.suggestedHandle).toMatch(/^\{\{vault:sec_[0-9a-zA-Z]{26}\}\}$/);
+      }
+    });
+
+    it("absorbs plaintext credentials into vault records and creates template via vault_absorb_credentials", async () => {
+      const { client, vaultId } = await createConnectedTestPair();
+      const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "mcp-absorb-test-"));
+      const envPath = path.join(tempDir, ".env");
+
+      try {
+        const mockOpenAi = ["sk", "proj", "AbsorbMcpTestKey1234567890abcdef"].join("-");
+        const mockGithub = ["ghp", "AbsorbMcpGithubToken1234567890abcdef"].join("_");
+        fs.writeFileSync(
+          envPath,
+          ["# Service Keys", `OPENAI_API_KEY=${mockOpenAi}`, `GITHUB_TOKEN=${mockGithub}`].join(
+            "\n",
+          ),
+        );
+
+        // 1. Dry run
+        const dryRes = await client.callTool({
+          name: "vault_absorb_credentials",
+          arguments: {
+            filePath: envPath,
+            dryRun: true,
+            vaultId,
+          },
+        });
+        expect(dryRes.isError).toBeFalsy();
+        const dryResult = parseToolJson<{
+          success: boolean;
+          dryRun: boolean;
+          absorbedCount: number;
+          actions: Array<{ secretName: string; handle: string }>;
+        }>(dryRes);
+        expect(dryResult.dryRun).toBe(true);
+        expect(dryResult.absorbedCount).toBe(2);
+
+        // 2. Live absorb
+        const liveRes = await client.callTool({
+          name: "vault_absorb_credentials",
+          arguments: {
+            filePath: envPath,
+            dryRun: false,
+            vaultId,
+          },
+        });
+        expect(liveRes.isError).toBeFalsy();
+        const liveResult = parseToolJson<{
+          success: boolean;
+          dryRun: boolean;
+          absorbedCount: number;
+          actions: Array<{ secretName: string; secretId: string; handle: string }>;
+        }>(liveRes);
+        expect(liveResult.dryRun).toBe(false);
+        expect(liveResult.absorbedCount).toBe(2);
+
+        // Verify template file was generated
+        const tplPath = `${envPath}.tpl`;
+        expect(fs.existsSync(tplPath)).toBe(true);
+        const tplContent = fs.readFileSync(tplPath, "utf8");
+        expect(tplContent).toContain("OPENAI_API_KEY={{vault:sec_");
+        expect(tplContent).toContain("GITHUB_TOKEN={{vault:sec_");
+
+        // Verify newly absorbed secrets can be queried via vault_get_secret
+        const firstSecId = liveResult.actions[0]!.secretId;
+        const getRes = await client.callTool({
+          name: "vault_get_secret",
+          arguments: { secretId: firstSecId },
+        });
+        expect(getRes.isError).toBeFalsy();
+        const getResult = parseToolJson<{ handle: string }>(getRes);
+        expect(getResult.handle).toBe(`{{vault:${firstSecId}}}`);
+      } finally {
+        await fs.promises.rm(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("manages git pre-commit hooks via vault_install_pre_commit_hook", async () => {
+      const { client } = await createConnectedTestPair();
+      const mockGitRepo = await fs.promises.mkdtemp(path.join(os.tmpdir(), "mcp-hook-test-"));
+      fs.mkdirSync(path.join(mockGitRepo, ".git", "hooks"), { recursive: true });
+
+      try {
+        // 1. Initial status
+        const statusRes = await client.callTool({
+          name: "vault_install_pre_commit_hook",
+          arguments: {
+            action: "status",
+            workspaceDir: mockGitRepo,
+          },
+        });
+        expect(statusRes.isError).toBeFalsy();
+        expect(parseToolJson<{ installed: boolean }>(statusRes).installed).toBe(false);
+
+        // 2. Install hook
+        const installRes = await client.callTool({
+          name: "vault_install_pre_commit_hook",
+          arguments: {
+            action: "install",
+            workspaceDir: mockGitRepo,
+          },
+        });
+        expect(installRes.isError).toBeFalsy();
+        const installResult = parseToolJson<{ installed: boolean; isLlmVaultHook: boolean }>(
+          installRes,
+        );
+        expect(installResult.installed).toBe(true);
+        expect(installResult.isLlmVaultHook).toBe(true);
+
+        // 3. Remove hook
+        const removeRes = await client.callTool({
+          name: "vault_install_pre_commit_hook",
+          arguments: {
+            action: "remove",
+            workspaceDir: mockGitRepo,
+          },
+        });
+        expect(removeRes.isError).toBeFalsy();
+        expect(parseToolJson<{ installed: boolean }>(removeRes).installed).toBe(false);
+      } finally {
+        await fs.promises.rm(mockGitRepo, { recursive: true, force: true });
+      }
+    });
   });
 
   it("validates supported MCP transports and rejects deprecated SSE", () => {
