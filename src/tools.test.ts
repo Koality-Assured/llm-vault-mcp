@@ -918,6 +918,65 @@ describe("llm-vault-mcp zero-context tool contracts", () => {
         await fs.promises.rm(mockGitRepo, { recursive: true, force: true });
       }
     });
+
+    it("queries vault_ssh_agent_status and handles inactive socket cleanly", async () => {
+      const { client } = await createConnectedTestPair();
+      const res = await client.callTool({
+        name: "vault_ssh_agent_status",
+        arguments: {
+          socketPath: path.join(os.tmpdir(), "nonexistent-test-ssh-agent.sock"),
+        },
+      });
+
+      expect(res.isError).toBeFalsy();
+      const status = parseToolJson<{ running: boolean; keyCount: number; keys: unknown[] }>(res);
+      expect(status.running).toBe(false);
+      expect(status.keyCount).toBe(0);
+      expect(status.keys).toHaveLength(0);
+    });
+
+    it("generates Kubernetes ESO SecretStore and ExternalSecret manifests via vault_k8s_eso_template", async () => {
+      const { client } = await createConnectedTestPair();
+      const vltId = generateId("vlt");
+      const secId1 = generateId("sec");
+      const secId2 = generateId("sec");
+
+      const res = await client.callTool({
+        name: "vault_k8s_eso_template",
+        arguments: {
+          vaultId: vltId,
+          targetNamespace: "production",
+          storeName: "corp-vault-store",
+          secretName: "payment-service-secrets",
+          apiEndpoint: "https://vault.corp.internal:8443",
+          secrets: [
+            { secretKey: "DATABASE_URL", remoteSecretId: secId1 },
+            { secretKey: "STRIPE_SECRET_KEY", remoteSecretId: secId2 },
+          ],
+        },
+      });
+
+      expect(res.isError).toBeFalsy();
+      const template = parseToolJson<{
+        secretStoreYaml: string;
+        externalSecretYaml: string;
+        explanation: string;
+        applyInstructions: string;
+      }>(res);
+
+      expect(template.secretStoreYaml).toContain("kind: SecretStore");
+      expect(template.secretStoreYaml).toContain("name: corp-vault-store");
+      expect(template.secretStoreYaml).toContain("namespace: production");
+      expect(template.secretStoreYaml).toContain("https://vault.corp.internal:8443");
+
+      expect(template.externalSecretYaml).toContain("kind: ExternalSecret");
+      expect(template.externalSecretYaml).toContain("name: payment-service-secrets");
+      expect(template.externalSecretYaml).toContain(`key: ${secId1}`);
+      expect(template.externalSecretYaml).toContain(`key: ${secId2}`);
+
+      expect(template.explanation).toContain(vltId);
+      expect(template.applyInstructions).toContain("kubectl apply");
+    });
   });
 
   it("validates supported MCP transports and rejects deprecated SSE", () => {
