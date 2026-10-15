@@ -475,6 +475,282 @@ describe("llm-vault-mcp zero-context tool contracts", () => {
     expect(runOut.stdout).toContain(`DB_PASS=[REDACTED:${created.id}]`);
   });
 
+  it("acquires ephemeral lease and explicitly revokes it via vault_revoke_lease", async () => {
+    const { client, vaultId, runtime } = await createConnectedTestPair();
+
+    const genRes = await client.callTool({
+      name: "vault_generate_and_store_secret",
+      arguments: {
+        vaultId,
+        name: "Ephemeral API Key",
+        byteLength: 32,
+      },
+    });
+    expect(genRes.isError).toBeFalsy();
+    const created = parseToolJson<{ id: string }>(genRes);
+
+    const leaseRes = await client.callTool({
+      name: "vault_lease_secret",
+      arguments: {
+        secretId: created.id,
+        ttlSeconds: 60,
+      },
+    });
+    expect(leaseRes.isError).toBeFalsy();
+    const lease = parseToolJson<{ leaseId: string; handle: string; ttlSeconds: number }>(leaseRes);
+    expect(lease.leaseId).toMatch(/^lease_[0-7][0-9a-hjkmnp-tv-z]{25}$/);
+    expect(lease.handle).toBe(`{{vault:${lease.leaseId}}}`);
+
+    // Verify lease is active in runtime
+    expect(() => runtime.leaseManager.resolveLeaseBytes(lease.leaseId)).not.toThrow();
+
+    // Explicitly revoke lease
+    const revokeRes = await client.callTool({
+      name: "vault_revoke_lease",
+      arguments: {
+        leaseId: lease.leaseId,
+      },
+    });
+    expect(revokeRes.isError).toBeFalsy();
+    const revoked = parseToolJson<{ success: boolean; leaseId: string }>(revokeRes);
+    expect(revoked.success).toBe(true);
+    expect(revoked.leaseId).toBe(lease.leaseId);
+
+    // Verify lease buffer was zeroized and lease is no longer valid
+    expect(() => runtime.leaseManager.resolveLeaseBytes(lease.leaseId)).toThrow(
+      /expired or does not exist/,
+    );
+
+    // Revoking again returns success: false
+    const revokeAgainRes = await client.callTool({
+      name: "vault_revoke_lease",
+      arguments: {
+        leaseId: lease.leaseId,
+      },
+    });
+    expect(revokeAgainRes.isError).toBeFalsy();
+    expect(parseToolJson<{ success: boolean }>(revokeAgainRes).success).toBe(false);
+  });
+
+  it("enforces out-of-band confirmation workflow for vault_delete_secret and vault_confirm_action", async () => {
+    let promptCount = 0;
+    const { client, vaultId } = await createConnectedTestPair({
+      scopes: [
+        "secrets:create",
+        "secrets:read",
+        "secrets:reveal",
+        "secrets:update",
+        "secrets:delete",
+        "agent:lease:acquire",
+        "agent:exec:run",
+        "agent:exec:http_proxy",
+        "admin:audit:read",
+      ],
+      oobConfirmHandler: async () => {
+        promptCount++;
+        return false; // Simulate human operator not approving immediately interactively
+      },
+    });
+
+    const genRes = await client.callTool({
+      name: "vault_generate_and_store_secret",
+      arguments: {
+        vaultId,
+        name: "Key to Delete",
+        byteLength: 16,
+      },
+    });
+    expect(genRes.isError).toBeFalsy();
+    const created = parseToolJson<{ id: string }>(genRes);
+
+    // 1. Initial delete attempt without confirmationToken returns pending_confirmation
+    const deleteRes = await client.callTool({
+      name: "vault_delete_secret",
+      arguments: {
+        secretId: created.id,
+      },
+    });
+    expect(deleteRes.isError).toBeFalsy();
+    const pending = parseToolJson<{
+      status: string;
+      confirmationToken: string;
+      secretId: string;
+      success: boolean;
+      prompt: string;
+    }>(deleteRes);
+
+    expect(promptCount).toBe(1);
+    expect(pending.status).toBe("pending_confirmation");
+    expect(pending.success).toBe(false);
+    expect(pending.confirmationToken).toMatch(/^conf_[0-9a-f]{32}$/);
+    expect(pending.prompt).toContain("CAUTION");
+
+    // 2. Reject pending action via vault_confirm_action
+    const rejectRes = await client.callTool({
+      name: "vault_confirm_action",
+      arguments: {
+        confirmationToken: pending.confirmationToken,
+        approved: false,
+      },
+    });
+    expect(rejectRes.isError).toBeFalsy();
+    const rejected = parseToolJson<{ status: string; action: string }>(rejectRes);
+    expect(rejected.status).toBe("cancelled");
+    expect(rejected.action).toBe("delete_secret");
+
+    // 3. New delete attempt generates a fresh confirmation token
+    const deleteRes2 = await client.callTool({
+      name: "vault_delete_secret",
+      arguments: {
+        secretId: created.id,
+      },
+    });
+    expect(deleteRes2.isError).toBeFalsy();
+    const pending2 = parseToolJson<{ confirmationToken: string }>(deleteRes2);
+
+    // 4. Confirm deletion via vault_confirm_action with approved: true
+    const confirmRes = await client.callTool({
+      name: "vault_confirm_action",
+      arguments: {
+        confirmationToken: pending2.confirmationToken,
+        approved: true,
+      },
+    });
+    expect(confirmRes.isError).toBeFalsy();
+    const confirmed = parseToolJson<{ status: string; success: boolean; secretId: string }>(
+      confirmRes,
+    );
+    expect(confirmed.status).toBe("deleted");
+    expect(confirmed.success).toBe(true);
+    expect(confirmed.secretId).toBe(created.id);
+
+    // 5. Verify secret is gone
+    const searchRes = await client.callTool({
+      name: "vault_search",
+      arguments: { query: "Key to Delete" },
+    });
+    expect(searchRes.isError).toBeFalsy();
+    expect(parseToolJson<unknown[]>(searchRes)).toHaveLength(0);
+  });
+
+  it("enforces out-of-band confirmation workflow for break-glass raw secret reveal", async () => {
+    const { client, vaultId } = await createConnectedTestPair({
+      allowRawContextReveal: true,
+      oobConfirmHandler: async () => false, // Require OOB confirmation token
+    });
+
+    const genRes = await client.callTool({
+      name: "vault_generate_and_store_secret",
+      arguments: {
+        vaultId,
+        name: "Emergency API Key",
+        byteLength: 16,
+      },
+    });
+    expect(genRes.isError).toBeFalsy();
+    const created = parseToolJson<{ id: string }>(genRes);
+
+    // Attempt break-glass reveal without pre-approval
+    const revealAttempt = await client.callTool({
+      name: "vault_get_secret",
+      arguments: {
+        secretId: created.id,
+        requestRawPlaintext: true,
+        breakGlassReason: "Emergency outage investigation",
+      },
+    });
+
+    expect(revealAttempt.isError).toBe(true);
+    const content = revealAttempt.content as Array<{ type: string; text: string }>;
+    const errMessage = content[0]?.text ?? "";
+
+    expect(errMessage).toContain("OOB_APPROVAL_REQUIRED");
+    const tokenMatch = errMessage.match(/conf_[0-9a-f]{32}/);
+    expect(tokenMatch).not.toBeNull();
+    const confirmationToken = tokenMatch![0];
+
+    // Approve the break-glass action via vault_confirm_action
+    const confirmRes = await client.callTool({
+      name: "vault_confirm_action",
+      arguments: {
+        confirmationToken,
+        approved: true,
+      },
+    });
+
+    expect(confirmRes.isError).toBeFalsy();
+    const revealed = parseToolJson<{
+      id: string;
+      plaintextValue: string;
+      redacted: boolean;
+    }>(confirmRes);
+
+    expect(revealed.id).toBe(created.id);
+    expect(revealed.redacted).toBe(false);
+    expect(revealed.plaintextValue).toBeDefined();
+    expect(revealed.plaintextValue.length).toBeGreaterThan(0);
+  });
+
+  it("red-teams prompt injection attacks by scrubbing raw, base64, and url-encoded secret echoes across stdout, stderr, and headers", async () => {
+    let capturedEnv: Record<string, string> = {};
+    const { client, vaultId } = await createConnectedTestPair({
+      commandRunner: async (_cmd, _args, env) => {
+        capturedEnv = env;
+        const rawSecret = env.TARGET_SECRET || "";
+        const b64Secret = Buffer.from(rawSecret, "utf-8").toString("base64");
+        const urlSecret = encodeURIComponent(rawSecret);
+
+        return {
+          exitCode: 0,
+          stdout: `Injected stdout raw: "${rawSecret}", base64: "${b64Secret}", url: "${urlSecret}"`,
+          stderr: `Injected stderr raw: "${rawSecret}", base64: "${b64Secret}", url: "${urlSecret}"`,
+        };
+      },
+    });
+
+    const genRes = await client.callTool({
+      name: "vault_generate_and_store_secret",
+      arguments: {
+        vaultId,
+        name: "High Entropy Target Secret",
+        byteLength: 24,
+      },
+    });
+    const created = parseToolJson<{ id: string; handle: string }>(genRes);
+
+    const runRes = await client.callTool({
+      name: "vault_run_command",
+      arguments: {
+        command: "sh",
+        args: ["-c", "echo $TARGET_SECRET"],
+        env: {
+          TARGET_SECRET: created.handle,
+        },
+      },
+    });
+
+    const output = parseToolJson<{ exitCode: number; stdout: string; stderr: string }>(runRes);
+    const rawPlaintext = capturedEnv.TARGET_SECRET;
+    expect(rawPlaintext).toBeDefined();
+    expect(rawPlaintext!.length).toBeGreaterThan(10);
+
+    // Verify raw secret does NOT appear in stdout or stderr
+    expect(output.stdout).not.toContain(rawPlaintext);
+    expect(output.stderr).not.toContain(rawPlaintext);
+
+    // Verify Base64 and URL encoded variants are also redacted
+    const b64 = Buffer.from(rawPlaintext!, "utf-8").toString("base64");
+    const urlEnc = encodeURIComponent(rawPlaintext!);
+    expect(output.stdout).not.toContain(b64);
+    expect(output.stdout).not.toContain(urlEnc);
+    expect(output.stderr).not.toContain(b64);
+    expect(output.stderr).not.toContain(urlEnc);
+
+    // Verify redaction placeholder format
+    expect(output.stdout).toContain(`[REDACTED:${created.id}]`);
+    expect(output.stderr).toContain(`[REDACTED:${created.id}]`);
+  });
+
   it("validates supported MCP transports and rejects deprecated SSE", () => {
     expect(assertSupportedTransport("stdio")).toBe("stdio");
     expect(assertSupportedTransport("streamable-http")).toBe("streamable-http");

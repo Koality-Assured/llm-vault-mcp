@@ -61,6 +61,14 @@ export interface SecretCleartextMetadata {
   folderId?: PrefixedId<"fld"> | undefined;
 }
 
+export interface PendingConfirmationRecord {
+  confirmationToken: string;
+  action: "delete_secret" | "break_glass_reveal";
+  targetId: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+}
+
 export interface StoredCiphertextSecretRecord {
   id: PrefixedId<"sec">;
   tenantId: string;
@@ -259,6 +267,7 @@ export class VaultRuntime {
   private readonly httpFetcher: HttpFetcher;
   private readonly oobConfirmHandler: OobConfirmationHandler;
   private readonly oobSecretPromptHandler: OobSecretPromptHandler;
+  private readonly pendingConfirmations = new Map<string, PendingConfirmationRecord>();
 
   constructor(options: VaultRuntimeOptions = {}) {
     this.tenantId = options.tenantId ?? "tnt_default";
@@ -845,12 +854,13 @@ export class VaultRuntime {
   /**
    * Resolves a secret for the agent. Returns an opaque `{{vault:sec_<ulid>}}` handle by default.
    * Blocks raw plaintext reveal unless BOTH `allowRawContextReveal: true` is configured on the
-   * agent policy AND out-of-band human confirmation (`oobConfirmHandler`) approves the request.
+   * agent policy AND out-of-band human confirmation (`oobConfirmHandler` or confirmationToken) approves the request.
    */
   public async getSecret(params: {
     secretId: PrefixedId<"sec">;
     requestRawPlaintext?: boolean | undefined;
     breakGlassReason?: string | undefined;
+    confirmationToken?: string | undefined;
   }): Promise<{
     id: PrefixedId<"sec">;
     vaultId: PrefixedId<"vlt">;
@@ -858,7 +868,10 @@ export class VaultRuntime {
     version: number;
     handle: string;
     redacted: boolean;
-    plaintextValue?: string;
+    plaintextValue?: string | undefined;
+    status?: "pending_confirmation" | undefined;
+    confirmationToken?: string | undefined;
+    prompt?: string | undefined;
   }> {
     this.assertScope("secrets:read");
     let record = this.secrets.get(params.secretId);
@@ -932,21 +945,44 @@ export class VaultRuntime {
       );
     }
 
-    const approved = await this.oobConfirmHandler({
-      reason: params.breakGlassReason ?? "Agent requested raw plaintext reveal",
-      targetId: params.secretId,
-      actorId: this.agentId,
-    });
+    if (params.confirmationToken) {
+      const pending = this.pendingConfirmations.get(params.confirmationToken);
+      if (
+        !pending ||
+        pending.action !== "break_glass_reveal" ||
+        pending.targetId !== params.secretId ||
+        Date.now() > pending.expiresAtMs
+      ) {
+        throw new Error("Invalid or expired confirmationToken for break-glass reveal.");
+      }
+      this.pendingConfirmations.delete(params.confirmationToken);
+    } else {
+      const approved = await this.oobConfirmHandler({
+        reason: params.breakGlassReason ?? "Agent requested raw plaintext reveal",
+        targetId: params.secretId,
+        actorId: this.agentId,
+      });
 
-    if (!approved) {
-      await this.appendAuditEvent("secrets:reveal_blocked_oob", params.secretId);
-      throw new Error(
-        `OOB_APPROVAL_REQUIRED: Out-of-band human operator denied or did not approve raw plaintext reveal for "${params.secretId}".`,
-      );
+      if (!approved) {
+        const confirmationToken = `conf_${globalThis.crypto.randomUUID().replace(/-/g, "")}`;
+        this.pendingConfirmations.set(confirmationToken, {
+          confirmationToken,
+          action: "break_glass_reveal",
+          targetId: params.secretId,
+          createdAtMs: Date.now(),
+          expiresAtMs: Date.now() + 5 * 60 * 1000,
+        });
+
+        await this.appendAuditEvent("secrets:reveal_blocked_oob", params.secretId);
+        throw new Error(
+          `OOB_APPROVAL_REQUIRED: Out-of-band human operator denied or did not approve raw plaintext reveal for "${params.secretId}". Pending confirmation token: "${confirmationToken}".`,
+        );
+      }
     }
 
     const { plaintextBytes } = await this.decryptSecretPayloadBytes(params.secretId);
     try {
+      await this.appendAuditEvent("secrets:reveal_break_glass", params.secretId);
       return {
         id: meta.id,
         vaultId: meta.vaultId,
@@ -959,6 +995,149 @@ export class VaultRuntime {
     } finally {
       zeroizeBuffer(plaintextBytes);
     }
+  }
+
+  /**
+   * Deletes a secret from local memory and remote API.
+   * Requires 'secrets:delete' scope and out-of-band confirmation.
+   */
+  public async deleteSecret(params: {
+    secretId: PrefixedId<"sec">;
+    confirmationToken?: string | undefined;
+  }): Promise<{
+    status: "deleted" | "pending_confirmation";
+    secretId: PrefixedId<"sec">;
+    success: boolean;
+    confirmationToken?: string | undefined;
+    prompt?: string | undefined;
+  }> {
+    this.assertScope("secrets:delete");
+    if (!isValidId(params.secretId, "sec")) {
+      throw new Error(`Invalid secretId: "${params.secretId}"`);
+    }
+
+    const existing = this.secrets.get(params.secretId);
+    if (!existing && !this.remoteApiUrl) {
+      throw new Error(`Secret "${params.secretId}" not found`);
+    }
+
+    if (params.confirmationToken) {
+      const pending = this.pendingConfirmations.get(params.confirmationToken);
+      if (
+        !pending ||
+        pending.action !== "delete_secret" ||
+        pending.targetId !== params.secretId ||
+        Date.now() > pending.expiresAtMs
+      ) {
+        throw new Error("Invalid or expired confirmationToken for secret deletion.");
+      }
+      this.pendingConfirmations.delete(params.confirmationToken);
+    } else {
+      const approved = await this.oobConfirmHandler({
+        reason: `Confirm deletion of secret "${params.secretId}"`,
+        targetId: params.secretId,
+        actorId: this.agentId,
+      });
+
+      if (!approved) {
+        const confirmationToken = `conf_${globalThis.crypto.randomUUID().replace(/-/g, "")}`;
+        this.pendingConfirmations.set(confirmationToken, {
+          confirmationToken,
+          action: "delete_secret",
+          targetId: params.secretId,
+          createdAtMs: Date.now(),
+          expiresAtMs: Date.now() + 5 * 60 * 1000,
+        });
+
+        return {
+          status: "pending_confirmation",
+          confirmationToken,
+          secretId: params.secretId,
+          success: false,
+          prompt: `CAUTION: Destructive deletion requested for secret "${params.secretId}". Confirm by supplying confirmationToken "${confirmationToken}" to vault_delete_secret or vault_confirm_action.`,
+        };
+      }
+    }
+
+    this.secrets.delete(params.secretId);
+
+    if (this.remoteApiUrl) {
+      try {
+        await this.httpFetcher(`${this.remoteApiUrl}/api/v1/secrets/${params.secretId}`, {
+          method: "DELETE",
+          headers: this.getAuthHeaders(),
+        });
+      } catch (err: unknown) {
+        process.stderr.write(
+          `Notice: failed to delete remote secret ${params.secretId}: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
+    }
+
+    await this.appendAuditEvent("secrets:delete", params.secretId);
+    return {
+      success: true,
+      secretId: params.secretId,
+      status: "deleted",
+    };
+  }
+
+  /**
+   * Explicitly revokes an active ephemeral lease and zeroes its in-memory buffer.
+   */
+  public async revokeLease(params: {
+    leaseId: PrefixedId<"lease">;
+  }): Promise<{ success: boolean; leaseId: PrefixedId<"lease"> }> {
+    this.assertScope("agent:lease:acquire");
+    if (!isValidId(params.leaseId, "lease")) {
+      throw new Error(`Invalid leaseId: "${params.leaseId}"`);
+    }
+    const success = this.leaseManager.revokeLease(params.leaseId);
+    await this.appendAuditEvent("agent:lease:revoke", params.leaseId);
+    return {
+      success,
+      leaseId: params.leaseId,
+    };
+  }
+
+  /**
+   * Confirms or rejects a pending destructive or break-glass action using an OOB confirmationToken.
+   */
+  public async confirmAction(params: {
+    confirmationToken: string;
+    approved: boolean;
+  }): Promise<unknown> {
+    const pending = this.pendingConfirmations.get(params.confirmationToken);
+    if (!pending || Date.now() > pending.expiresAtMs) {
+      throw new Error("Confirmation token is invalid or has expired.");
+    }
+
+    if (!params.approved) {
+      this.pendingConfirmations.delete(params.confirmationToken);
+      await this.appendAuditEvent("action_rejected_oob", pending.targetId);
+      return {
+        status: "cancelled",
+        action: pending.action,
+        targetId: pending.targetId,
+      };
+    }
+
+    if (pending.action === "delete_secret") {
+      return await this.deleteSecret({
+        secretId: pending.targetId as PrefixedId<"sec">,
+        confirmationToken: params.confirmationToken,
+      });
+    }
+
+    if (pending.action === "break_glass_reveal") {
+      return await this.getSecret({
+        secretId: pending.targetId as PrefixedId<"sec">,
+        requestRawPlaintext: true,
+        confirmationToken: params.confirmationToken,
+      });
+    }
+
+    throw new Error(`Unknown pending action: ${pending.action}`);
   }
 
   /**
@@ -1376,11 +1555,14 @@ export const REGISTERED_TOOL_NAMES = [
   "vault_list_tags",
   "vault_get_secret",
   "vault_lease_secret",
+  "vault_revoke_lease",
   "vault_run_command",
   "vault_inject_env",
   "vault_http_proxy",
   "vault_generate_and_store_secret",
   "vault_prompt_secret_oob",
+  "vault_delete_secret",
+  "vault_confirm_action",
   "vault_admin_audit_logs",
 ] as const;
 
@@ -1451,6 +1633,7 @@ export function createVaultMcpServer(runtime: VaultRuntime = new VaultRuntime())
         secretId: prefixedIdSchema("sec"),
         requestRawPlaintext: z.boolean().optional(),
         breakGlassReason: z.string().min(1).optional(),
+        confirmationToken: z.string().optional(),
       },
     },
     async (args) => {
@@ -1481,6 +1664,24 @@ export function createVaultMcpServer(runtime: VaultRuntime = new VaultRuntime())
     async (args) => {
       try {
         return jsonResult(await runtime.leaseSecret(args));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "vault_revoke_lease",
+    {
+      description:
+        "Explicitly revoke an active lease_<ulid> handle and immediately zeroize its in-memory buffer.",
+      inputSchema: {
+        leaseId: prefixedIdSchema("lease"),
+      },
+    },
+    async (args) => {
+      try {
+        return jsonResult(await runtime.revokeLease(args));
       } catch (err) {
         return errorResult(err);
       }
@@ -1590,6 +1791,44 @@ export function createVaultMcpServer(runtime: VaultRuntime = new VaultRuntime())
     async (args) => {
       try {
         return jsonResult(await runtime.promptSecretOob(args));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "vault_delete_secret",
+    {
+      description:
+        "Delete a secret item from the vault. Requires 'secrets:delete' scope and out-of-band human confirmation. Returns a pending confirmationToken when unconfirmed.",
+      inputSchema: {
+        secretId: prefixedIdSchema("sec"),
+        confirmationToken: z.string().optional(),
+      },
+    },
+    async (args) => {
+      try {
+        return jsonResult(await runtime.deleteSecret(args));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "vault_confirm_action",
+    {
+      description:
+        "Confirm or cancel a pending destructive action or break-glass reveal using an out-of-band confirmation token.",
+      inputSchema: {
+        confirmationToken: z.string().min(1),
+        approved: z.boolean(),
+      },
+    },
+    async (args) => {
+      try {
+        return jsonResult(await runtime.confirmAction(args));
       } catch (err) {
         return errorResult(err);
       }
