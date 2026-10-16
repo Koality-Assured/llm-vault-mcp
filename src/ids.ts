@@ -14,11 +14,11 @@ for (let i = 0; i < CROCKFORD_ALPHABET.length; i++) {
   CROCKFORD_DECODE_MAP.set(ch.toUpperCase(), i);
 }
 
-const ULID_BODY_REGEX = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/;
+const ULID_BODY_REGEX = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/i;
 
-const OPAQUE_HANDLE_EXACT_REGEX = /^\{\{vault:((?:sec|lease)_[0-7][0-9a-hjkmnp-tv-z]{25})\}\}$/;
+const OPAQUE_HANDLE_EXACT_REGEX = /^\{\{vault:((?:sec|lease)_[0-7][0-9a-hjkmnp-tv-z]{25})\}\}$/i;
 
-const OPAQUE_HANDLE_GLOBAL_REGEX = /\{\{vault:((?:sec|lease)_[0-7][0-9a-hjkmnp-tv-z]{25})\}\}/g;
+const OPAQUE_HANDLE_GLOBAL_REGEX = /\{\{vault:((?:sec|lease)_[0-7][0-9a-hjkmnp-tv-z]{25})\}\}/gi;
 
 /**
  * Encodes a 48-bit millisecond timestamp into 10 Crockford Base32 characters.
@@ -156,12 +156,13 @@ export type SecretOrLeaseId = PrefixedId<"sec"> | PrefixedId<"lease">;
  * (`{{vault:sec_<ulid>}}` or `{{vault:lease_<ulid>}}`) safe for LLM context windows.
  */
 export function formatOpaqueHandle(id: string): string {
-  if (!isValidId(id, "sec") && !isValidId(id, "lease")) {
+  const normalizedId = id.toLowerCase();
+  if (!isValidId(normalizedId, "sec") && !isValidId(normalizedId, "lease")) {
     throw new Error(
       `Opaque handles can only wrap sec_<ulid> or lease_<ulid> identifiers (received "${id}")`,
     );
   }
-  return `{{vault:${id}}}`;
+  return `{{vault:${normalizedId}}}`;
 }
 
 export interface ParsedOpaqueHandle {
@@ -180,17 +181,19 @@ export function parseOpaqueHandle(input: string): ParsedOpaqueHandle | null {
   const candidateId = match ? match[1]! : trimmed;
 
   if (isValidId(candidateId, "sec")) {
+    const normalized = candidateId.toLowerCase() as SecretOrLeaseId;
     return {
       kind: "sec",
-      id: candidateId,
-      handle: formatOpaqueHandle(candidateId),
+      id: normalized,
+      handle: formatOpaqueHandle(normalized),
     };
   }
   if (isValidId(candidateId, "lease")) {
+    const normalized = candidateId.toLowerCase() as SecretOrLeaseId;
     return {
       kind: "lease",
-      id: candidateId,
-      handle: formatOpaqueHandle(candidateId),
+      id: normalized,
+      handle: formatOpaqueHandle(normalized),
     };
   }
   return null;
