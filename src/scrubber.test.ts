@@ -50,4 +50,20 @@ describe("zero-context output scrubber", () => {
     expect(safeHeaders["x-echo-secret"]).toBe(`Bearer [REDACTED:${secId}]`);
     expect(safeHeaders["Authorization"]).toBe("[REDACTED:HEADER]");
   });
+
+  it("scrubs URL-encoded secrets formatted with lowercase hexadecimal escapes", () => {
+    const secId = generateId("sec", 1760000000000);
+    const rawSecret = "secret/key+123";
+    const secretBytes = encoder.encode(rawSecret);
+
+    const lowercaseUrlEncoded = encodeURIComponent(rawSecret).replace(/%[0-9A-Fa-f]{2}/g, (m) =>
+      m.toLowerCase(),
+    );
+
+    const log = `Redirecting to https://example.com/callback?token=${lowercaseUrlEncoded}`;
+    const scrubbed = scrubSecretsFromText(log, [{ id: secId, valueBytes: secretBytes }]);
+
+    expect(scrubbed).not.toContain(lowercaseUrlEncoded);
+    expect(scrubbed).toContain(`token=[REDACTED:${secId}]`);
+  });
 });

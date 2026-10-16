@@ -90,4 +90,23 @@ describe("ids & opaque handles", () => {
     expect(resolved).toBe("Bearer sk-live-secret-token / Lease=ephemeral-db-pass");
     expect(referencedIds).toEqual([secId, leaseId]);
   });
+
+  it("validates and parses case-insensitive Crockford Base32 ULIDs and opaque handles", () => {
+    const uppercaseSecId = "sec_01JK7A89B2C3D4E5F6G7H8J9K0";
+    expect(isValidId(uppercaseSecId, "sec")).toBe(true);
+    expect(isValidId(uppercaseSecId)).toBe(true);
+    expect(assertValidId(uppercaseSecId, "sec")).toBe(uppercaseSecId);
+
+    const parsed = parseOpaqueHandle(`{{vault:${uppercaseSecId}}}`);
+    expect(parsed).toEqual({
+      kind: "sec",
+      id: "sec_01jk7a89b2c3d4e5f6g7h8j9k0",
+      handle: "{{vault:sec_01jk7a89b2c3d4e5f6g7h8j9k0}}",
+    });
+
+    const uppercaseLeaseId = "lease_01JK7A89B2C3D4E5F6G7H8J9K0";
+    expect(isValidId(uppercaseLeaseId, "lease")).toBe(true);
+    expect(formatOpaqueHandle(uppercaseLeaseId)).toBe("{{vault:lease_01jk7a89b2c3d4e5f6g7h8j9k0}}");
+    expect(extractTimestampMs(uppercaseSecId)).toBeGreaterThan(0);
+  });
 });
