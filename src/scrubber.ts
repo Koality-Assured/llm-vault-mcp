@@ -38,6 +38,14 @@ function buildSecretVariants(valueBytes: Uint8Array): string[] {
     const urlEncoded = encodeURIComponent(utf8);
     if (urlEncoded.length > 0) {
       variants.add(urlEncoded);
+      const lowerUrl = urlEncoded.replace(/%[0-9A-Fa-f]{2}/g, (m) => m.toLowerCase());
+      if (lowerUrl !== urlEncoded) {
+        variants.add(lowerUrl);
+      }
+      const upperUrl = urlEncoded.replace(/%[0-9A-Fa-f]{2}/g, (m) => m.toUpperCase());
+      if (upperUrl !== urlEncoded) {
+        variants.add(upperUrl);
+      }
     }
   }
 
